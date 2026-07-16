@@ -30,7 +30,7 @@ de CPU-Z, CrystalDiskInfo, HWiNFO y Speccy en un solo script.
 .\PC-Inspector.ps1
 
 # Inspección + informes TXT
-.\PC-Inspector.ps1 --txt
+.\PC-Inspector.ps1 -Txt
 
 # Inspección + informes JSON y TXT (guardados junto al script)
 .\PC-Inspector.ps1 -Json -Txt
