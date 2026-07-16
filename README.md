@@ -1,93 +1,99 @@
 # PC Inspector
 
-A portable, dependency-free Windows hardware inspection utility written in
-pure PowerShell. Designed for evaluating a PC before buying it second-hand —
-think of it as a lightweight combination of CPU-Z, CrystalDiskInfo, HWiNFO
-and Speccy in a single script.
+Una utilidad portátil de inspección de hardware para Windows, escrita en
+PowerShell puro y sin dependencias externas. Diseñada para evaluar un PC
+antes de comprarlo de segunda mano. Piénsala como una combinación ligera
+de CPU-Z, CrystalDiskInfo, HWiNFO y Speccy en un solo script.
 
-## Highlights
+## Características principales
 
-- **Single portable script** — no installation, no registry modifications,
-  no external dependencies.
-- **Windows 10 / Windows 11**, PowerShell 5.1+ and PowerShell 7+.
-- **No administrator rights required.** Privileged data (SMART wear,
-  power-on hours, thermal zones) degrades gracefully to
-  `Unknown (requires Administrator)` instead of failing.
-- **Never crashes.** Every query is guarded with CIM → WMI → cmdlet →
-  registry → COM fallbacks; unknown values are always reported as `Unknown`.
-- Professional console UI with Unicode box drawing, colors and a progress
-  indicator.
-- **JSON and TXT export** of the complete report.
-- Automated **health check** (warnings) and objective **buyer analysis**.
-- Exit code `0` on success.
+- **Script único y portátil**: sin instalación, sin modificaciones al
+  registro, sin dependencias externas.
+- **Windows 10 / Windows 11**, PowerShell 5.1+ y PowerShell 7+.
+- **No requiere permisos de administrador.** Los datos privilegiados
+  (desgaste SMART, horas de encendido, zonas térmicas) se degradan de
+  forma controlada a `Unknown (requires Administrator)` en lugar de fallar.
+- **Nunca se cuelga.** Cada consulta está protegida con respaldos en
+  cascada: CIM → WMI → cmdlet → registro → COM; los valores desconocidos
+  siempre se muestran como `Unknown`.
+- Interfaz de consola profesional con caracteres Unicode de cuadro,
+  colores e indicador de progreso.
+- **Exportación a JSON y TXT** del informe completo.
+- **Chequeo de salud** automático (advertencias) y **análisis de comprador**
+  con observaciones objetivas.
+- Código de salida `0` en caso de éxito.
 
-## Usage
+## Uso
 
 ```powershell
-# Full inspection, console output only
+# Inspección completa, solo salida por consola
 .\PC-Inspector.ps1
 
-# Inspection + JSON and TXT reports (written next to the script)
+# Inspección + informes JSON y TXT (guardados junto al script)
 .\PC-Inspector.ps1 -Json -Txt
 
-# GNU-style flags are accepted too
+# También se aceptan flags estilo GNU
 powershell -ExecutionPolicy Bypass -File .\PC-Inspector.ps1 --json --txt
 
-# Custom export directory, no colors, ASCII borders
+# Directorio de exportación personalizado, sin colores, bordes ASCII
 .\PC-Inspector.ps1 -Json -OutputPath D:\Reports -NoColor -Ascii
 ```
 
-> Running as Administrator is optional but unlocks additional data:
-> SSD wear level, power-on hours, disk temperatures and ACPI thermal zones.
+> Ejecutar como Administrador es opcional, pero desbloquea datos
+> adicionales: nivel de desgaste del SSD, horas de encendido,
+> temperaturas de disco y zonas térmicas ACPI.
 
-### Parameters
+### Parámetros
 
-| Parameter     | Alias      | Description                                   |
+| Parámetro     | Alias      | Descripción                                   |
 |---------------|------------|-----------------------------------------------|
-| `-Json`       | `--json`   | Export the full report as JSON                |
-| `-Txt`        | `--txt`    | Export the full report as plain text          |
-| `-OutputPath` |            | Directory for export files (default: script folder) |
-| `-NoColor`    | `--nocolor`| Disable colored output (`NO_COLOR` env var also honored) |
-| `-Ascii`      | `--ascii`  | ASCII borders instead of Unicode box drawing  |
+| `-Json`       | `--json`   | Exporta el informe completo en formato JSON   |
+| `-Txt`        | `--txt`    | Exporta el informe completo en texto plano    |
+| `-OutputPath` |            | Directorio de exportación (por defecto: carpeta del script) |
+| `-NoColor`    | `--nocolor`| Desactiva la salida a color (también respeta la variable de entorno `NO_COLOR`) |
+| `-Ascii`      | `--ascii`  | Usa bordes ASCII en lugar de caracteres Unicode |
 
-## What it inspects
+## Qué inspecciona
 
-| Section     | Details |
-|-------------|---------|
-| System      | Manufacturer, model, serial, SKU, Windows edition/build, install date, activation, uptime, Secure Boot, UEFI/Legacy, TPM, BitLocker, Windows 11 compatibility |
-| CPU         | Model, generation (estimated), socket, cores/threads, clocks, L1/L2/L3 cache, virtualization/SLAT, AES-NI, AVX/AVX2/AVX-512, SSE versions, microcode revision |
-| Motherboard | Vendor, model, serial, chipset (estimated), BIOS vendor/version/date, SMBIOS version |
-| RAM         | Total, maximum supported, slots (total/used/free), channel configuration, and per module: vendor, part number, serial, capacity, speed, voltage, DDR generation, ECC, rank, form factor |
-| Storage     | Per disk: model, firmware, serial, capacity, partition style, bus type, SSD/NVMe/HDD, RPM, drive letters, SMART status, estimated health, SSD life, power-on hours, temperature; volumes and TRIM |
-| GPU         | Per GPU: vendor, model, VRAM (registry-accurate), driver version/date, integrated vs dedicated |
-| Network     | Ethernet/Wi-Fi/Bluetooth, MAC, link speed, driver, IPv4/IPv6, gateway, DNS |
-| USB         | Controllers, supported USB versions, connected devices |
-| PCI         | Every PCI device with driver and status |
-| Display     | Monitor model, manufacturer, year, diagonal size, active resolution and refresh rate |
-| Battery     | Design vs full-charge capacity, wear level, cycle count, health estimate |
-| Audio       | Devices with drivers |
-| Sensors     | ACPI thermal zones, disk temperature, fans (where exposed) |
+| Sección      | Detalles |
+|--------------|---------|
+| Sistema      | Fabricante, modelo, número de serie, SKU, edición y build de Windows, fecha de instalación, activación, tiempo de actividad, Secure Boot, UEFI/Legacy, TPM, BitLocker, compatibilidad con Windows 11 |
+| CPU          | Modelo, generación (estimada), socket, núcleos/hilos, frecuencias, caché L1/L2/L3, virtualización/SLAT, AES-NI, AVX/AVX2/AVX-512, versiones de SSE, revisión de microcódigo |
+| Placa base   | Fabricante, modelo, número de serie, chipset (estimado), fabricante/versión/fecha de BIOS, versión SMBIOS |
+| RAM          | Total instalado, máximo soportado, slots (totales/usados/libres), configuración de canales, y por cada módulo: fabricante, número de parte, serie, capacidad, velocidad, voltaje, generación DDR, ECC, rank, factor de forma |
+| Almacenamiento | Por cada disco: modelo, firmware, número de serie, capacidad, estilo de partición, tipo de bus, SSD/NVMe/HDD, RPM, letras de unidad, estado SMART, salud estimada, vida útil del SSD, horas de encendido, temperatura; volúmenes y estado de TRIM |
+| GPU          | Por cada GPU: fabricante, modelo, VRAM (precisa vía registro), versión/fecha del driver, integrada o dedicada |
+| Red          | Ethernet/Wi-Fi/Bluetooth, MAC, velocidad de enlace, driver, IPv4/IPv6, gateway, DNS |
+| USB          | Controladoras, versiones de USB soportadas, dispositivos conectados |
+| PCI          | Todos los dispositivos PCI con su driver y estado |
+| Pantalla     | Modelo de monitor, fabricante, año, tamaño diagonal, resolución y frecuencia de actualización activas |
+| Batería      | Capacidad de diseño vs. capacidad de carga completa, nivel de desgaste, ciclos de carga, estimación de salud |
+| Audio        | Dispositivos con sus drivers |
+| Sensores     | Zonas térmicas ACPI, temperatura de disco, ventiladores (donde estén disponibles) |
 
-## Health check
+## Chequeo de salud
 
-Automatic warnings for: old BIOS, single-channel or slow RAM, missing SSD,
-HDD boot drive, SMART problems, high temperatures, disabled virtualization,
-low disk space, outdated GPU drivers, battery wear, inactive Windows
-license, Legacy BIOS installs, and PCI devices with driver problems.
+Genera advertencias automáticas para: BIOS antigua, RAM en canal único o
+lenta, ausencia de SSD, disco de arranque en HDD, problemas SMART,
+temperaturas altas, virtualización desactivada, poco espacio en disco,
+drivers de GPU desactualizados, desgaste de batería, licencia de Windows
+inactiva, instalaciones en Legacy BIOS y dispositivos PCI con problemas
+de driver.
 
-## Buyer analysis
+## Análisis de comprador
 
-Objective, factual observations to support a purchase decision — free RAM
-slots, NVMe presence, boot-drive type, UEFI/TPM readiness for Windows 11,
-BIOS age, battery capacity retention.
+Observaciones objetivas y basadas en hechos para apoyar una decisión de
+compra: slots de RAM libres, presencia de NVMe, tipo de disco de
+arranque, preparación UEFI/TPM para Windows 11, antigüedad de la BIOS,
+retención de capacidad de la batería.
 
-## Exit codes
+## Códigos de salida
 
-| Code | Meaning |
-|------|---------|
-| 0    | Inspection completed successfully |
-| 1    | Fatal, unexpected failure |
+| Código | Significado |
+|--------|-------------|
+| 0      | La inspección se completó correctamente |
+| 1      | Fallo fatal e inesperado |
 
-## License
+## Licencia
 
 MIT
