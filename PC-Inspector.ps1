@@ -9,8 +9,9 @@
     a second-hand machine).
 
     Collects: System, CPU, Motherboard, RAM, Storage, GPU, Network, USB,
-    PCI devices, Display, Battery, Audio and Sensors. Generates a health
-    check (warnings) and an objective buyer analysis, plus JSON/TXT export.
+    PCI devices, Display, Battery, Audio and Sensors, plus an optional
+    CPU/disk performance benchmark. Generates a health check (warnings)
+    and an objective buyer analysis, plus JSON/TXT/HTML export.
 
     Design goals:
       - Windows 10 / Windows 11, PowerShell 5.1+ and PowerShell 7+.
@@ -25,6 +26,14 @@
 
 .PARAMETER Txt
     Export the full report as plain text (also accepted as --txt).
+
+.PARAMETER Html
+    Export the full report as a standalone HTML page (also accepted as --html).
+
+.PARAMETER Benchmark
+    Run the optional CPU and disk performance benchmark (also accepted as
+    --benchmark). Takes extra time and writes a temporary file to measure
+    real disk speed; the file is always deleted afterwards.
 
 .PARAMETER OutputPath
     Directory where export files are written. Defaults to the script folder.
@@ -41,8 +50,12 @@
     Run a full inspection with console output only.
 
 .EXAMPLE
-    .\PC-Inspector.ps1 -Json -Txt
-    Run a full inspection and export JSON and TXT reports.
+    .\PC-Inspector.ps1 -Json -Txt -Html
+    Run a full inspection and export JSON, TXT and HTML reports.
+
+.EXAMPLE
+    .\PC-Inspector.ps1 -Benchmark -Html
+    Run a full inspection including the CPU/disk benchmark and export HTML.
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\PC-Inspector.ps1 --json
@@ -50,7 +63,7 @@
 
 .NOTES
     Name    : PC Inspector
-    Version : 1.0.0
+    Version : 2.0.0
     License : MIT
     Exit    : 0 on success, 1 on fatal failure.
 #>
@@ -58,6 +71,8 @@
 param(
     [switch]$Json,
     [switch]$Txt,
+    [switch]$Html,
+    [switch]$Benchmark,
     [string]$OutputPath,
     [switch]$NoColor,
     [switch]$Ascii,
@@ -69,13 +84,15 @@ Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
 # ============================================================================
-#  GNU-style argument compatibility (--json, --txt, --nocolor, --ascii)
+#  GNU-style argument compatibility (--json, --txt, --html, --benchmark, ...)
 # ============================================================================
 foreach ($arg in @($ExtraArgs)) {
     if ([string]::IsNullOrWhiteSpace($arg)) { continue }
     switch -Regex ($arg) {
         '^--?json$'            { $Json = $true }
         '^--?txt$'             { $Txt = $true }
+        '^--?html?$'           { $Html = $true }
+        '^--?bench(mark)?$'    { $Benchmark = $true }
         '^--?no-?color$'       { $NoColor = $true }
         '^--?ascii$'           { $Ascii = $true }
         '^--?(help|\?)$'       { Get-Help -Detailed $MyInvocation.MyCommand.Path; exit 0 }
@@ -86,7 +103,7 @@ foreach ($arg in @($ExtraArgs)) {
 # ============================================================================
 #  Script-wide state
 # ============================================================================
-$Script:Version    = '1.0.0'
+$Script:Version    = '2.0.0'
 $Script:NoColor    = [bool]($NoColor -or $env:NO_COLOR)
 $Script:TxtBuffer  = New-Object System.Text.StringBuilder
 $Script:Raw        = @{}            # machine-readable facts for health/analysis
@@ -344,6 +361,113 @@ function Get-DriverInfoFor {
         $result.Date     = ConvertTo-DateTimeSafe (Get-PropValue $d @('DriverDate'))
         $result.Provider = Get-PropValue $d @('DriverProviderName')
     }
+    return $result
+}
+
+# ============================================================================
+#  PCIe link detection (Get-PnpDeviceProperty, no admin required)
+# ============================================================================
+
+# DEVPKEY_PciDevice_* property keys ({3ab22e31-...} pids 9-12, resolved by
+# Windows to their friendly names); the numeric link-speed encoding follows
+# the PCI Express spec (1 = 2.5 GT/s Gen1 ... 6 = 64 GT/s Gen6).
+$Script:PcieGenMap = @{ 1 = 'Gen1 (2.5 GT/s)'; 2 = 'Gen2 (5 GT/s)'; 3 = 'Gen3 (8 GT/s)'
+                        4 = 'Gen4 (16 GT/s)'; 5 = 'Gen5 (32 GT/s)'; 6 = 'Gen6 (64 GT/s)' }
+
+function Get-PcieLinkInfo {
+    <#
+        Reads the PCIe link speed/width device properties for a PCI device.
+        Returns @{ CurGen; CurWidth; MaxGen; MaxWidth; Display } with nulls
+        when the properties are not exposed (non-PCIe device, old Windows,
+        or missing PnpDevice module).
+    #>
+    param([string]$PnpDeviceId)
+    $info = @{ CurGen = $null; CurWidth = $null; MaxGen = $null; MaxWidth = $null; Display = $null }
+    if (-not $PnpDeviceId) { return $info }
+    if (-not (Get-Command Get-PnpDeviceProperty -ErrorAction SilentlyContinue)) { return $info }
+    # Disk/child devices (e.g. an NVMe disk's SCSI node) do not carry the PCIe
+    # properties themselves - walk up to the owning PCI controller node.
+    $hops = 0
+    while ($PnpDeviceId -notmatch '^PCI\\' -and $hops -lt 3) {
+        $PnpDeviceId = Invoke-Safe {
+            "$((Get-PnpDeviceProperty -InstanceId $PnpDeviceId -KeyName 'DEVPKEY_Device_Parent' -ErrorAction Stop).Data)"
+        }
+        if (-not $PnpDeviceId) { return $info }
+        $hops++
+    }
+    if ($PnpDeviceId -notmatch '^PCI\\') { return $info }
+    $keys = @(
+        'DEVPKEY_PciDevice_CurrentLinkSpeed'
+        'DEVPKEY_PciDevice_CurrentLinkWidth'
+        'DEVPKEY_PciDevice_MaxLinkSpeed'
+        'DEVPKEY_PciDevice_MaxLinkWidth'
+    )
+    $props = Invoke-Safe {
+        @(Get-PnpDeviceProperty -InstanceId $PnpDeviceId -KeyName $keys -ErrorAction Stop)
+    } @()
+    foreach ($p in @($props)) {
+        $key = "$(Get-PropValue $p @('KeyName'))"
+        $val = Get-PropValue $p @('Data')
+        if ($null -eq $val) { continue }
+        switch ($key) {
+            'DEVPKEY_PciDevice_CurrentLinkSpeed' { $info.CurGen   = [int]$val }
+            'DEVPKEY_PciDevice_CurrentLinkWidth' { $info.CurWidth = [int]$val }
+            'DEVPKEY_PciDevice_MaxLinkSpeed'     { $info.MaxGen   = [int]$val }
+            'DEVPKEY_PciDevice_MaxLinkWidth'     { $info.MaxWidth = [int]$val }
+        }
+    }
+    if ($info.CurGen -and $info.CurWidth) {
+        $cur = "$(($Script:PcieGenMap[$info.CurGen] -split ' ')[0]) x$($info.CurWidth)"
+        $display = $cur
+        if ($info.MaxGen -and $info.MaxWidth) {
+            # MaxLinkSpeed/Width come from the device's own capability
+            # register - they describe what the device could do, not what
+            # the slot allows.
+            $max = "$(($Script:PcieGenMap[$info.MaxGen] -split ' ')[0]) x$($info.MaxWidth)"
+            if ($max -ne $cur) { $display = "$cur (device capable of $max)" }
+            else { $display = "$cur (running at device maximum)" }
+        }
+        $info.Display = $display
+    }
+    return $info
+}
+
+function Get-BoardPcieGeneration {
+    <#
+        Estimates the motherboard's PCIe generation from the maximum link
+        speed advertised by its PCI Express root ports. Cached because the
+        scan issues one property query per root port.
+    #>
+    if ($Script:BoardPcieGen) { return $Script:BoardPcieGen }
+    $result = 'Unknown (not exposed on this system)'
+    $source = 'highest root port advertised'
+    $rootPorts = @(Get-CimSafe 'Win32_PnPEntity' -Filter (
+        "DeviceID LIKE 'PCI\\%' AND (Name LIKE '%Root Port%' OR Name LIKE '%Root Complex%')"))
+    $maxGen = 0
+    foreach ($rp in @($rootPorts) | Select-Object -First 24) {
+        $link = Get-PcieLinkInfo "$(Get-PropValue $rp @('DeviceID'))"
+        if ($link.MaxGen -and $link.MaxGen -gt $maxGen) { $maxGen = $link.MaxGen }
+    }
+    if ($maxGen -eq 0) {
+        # Some platforms (notably AMD) leave the properties empty on root
+        # ports; fall back to the endpoint devices most likely to sit on
+        # PCIe links (GPUs, storage/network controllers). Only negotiated
+        # (current) speeds are used here: a device's own maximum can exceed
+        # what the board supports.
+        $source = 'highest negotiated device link; the board may support more'
+        $endpoints = @(Get-CimSafe 'Win32_PnPEntity' -Filter (
+            "DeviceID LIKE 'PCI\\%' AND (PNPClass='Display' OR PNPClass='SCSIAdapter' OR " +
+            "PNPClass='HDC' OR PNPClass='Net' OR PNPClass='USB')"))
+        foreach ($ep in @($endpoints) | Select-Object -First 30) {
+            $link = Get-PcieLinkInfo "$(Get-PropValue $ep @('DeviceID'))"
+            if ($link.CurGen -and $link.CurGen -gt $maxGen) { $maxGen = $link.CurGen }
+        }
+    }
+    if ($maxGen -gt 0 -and $Script:PcieGenMap.ContainsKey($maxGen)) {
+        $result = "PCIe $($Script:PcieGenMap[$maxGen]) ($source)"
+        $Script:Raw.BoardPcieGen = $maxGen
+    }
+    $Script:BoardPcieGen = $result
     return $result
 }
 
@@ -800,7 +924,7 @@ function Get-MotherboardInfo {
         'BIOS Version'   = $biosDisplay
         'BIOS Date'      = Format-Date (Get-PropValue $bios @('ReleaseDate'))
         'SMBIOS Version' = Format-Value ("$(Get-PropValue $bios @('SMBIOSMajorVersion')).$(Get-PropValue $bios @('SMBIOSMinorVersion'))")
-        'PCIe Generation' = 'Unknown (not exposed via WMI; check board specifications)'
+        'PCIe Generation' = Get-BoardPcieGeneration
     }
 }
 
@@ -829,6 +953,32 @@ function Get-DdrGeneration {
         if ($s -ge 1066) { return 'DDR3 (estimated from speed)' }
     }
     return 'Unknown'
+}
+
+function Get-MemoryChannelId {
+    <#
+        Extracts a memory-channel identifier from a module's BankLabel /
+        DeviceLocator strings. Vendors encode the channel in many formats
+        ("ChannelA-DIMM0", "P0 CHANNEL A", "DIMM_A1", "A1", "BANK 2"...);
+        each pattern below covers a family of real-world SMBIOS strings.
+        Returns a short id ("A", "0", "bank0"...) or $null when unparseable.
+    #>
+    param([string]$Bank, [string]$Locator)
+    foreach ($src in @($Bank, $Locator)) {
+        if (-not $src) { continue }
+        if ($src -match 'CHANNEL[\s_-]*([A-Z0-9])') { return "$($Matches[1])" }
+        if ($src -match '\bCH[\s_-]*([A-Z])\b')     { return "$($Matches[1])" }
+        if ($src -match 'DIMM[\s_-]*([A-Z])\d*\b')  { return "$($Matches[1])" }
+        if ($src -match '^\s*([A-Z])[\s_-]?\d\s*$') { return "$($Matches[1])" }
+    }
+    # "BANK n" labels: consecutive bank pairs usually share a channel
+    # (BANK 0/1 = channel A, BANK 2/3 = channel B on most boards).
+    foreach ($src in @($Bank, $Locator)) {
+        if ($src -and $src -match 'BANK[\s_-]*(\d+)') {
+            return ('bank{0}' -f [Math]::Floor([int]$Matches[1] / 2))
+        }
+    }
+    return $null
 }
 
 function Get-RamInfo {
@@ -898,11 +1048,8 @@ function Get-RamInfo {
 
         $bank = "$(Get-PropValue $m @('BankLabel'))"
         $loc  = "$(Get-PropValue $m @('DeviceLocator'))"
-        foreach ($src in @($bank, $loc)) {
-            if ($src -match 'Channel\s*-?\s*([A-H0-9])') {
-                if (-not $channels.Contains($Matches[1])) { $channels.Add($Matches[1]) }
-            }
-        }
+        $chId = Get-MemoryChannelId $bank $loc
+        if ($chId -and -not $channels.Contains($chId)) { $channels.Add($chId) }
 
         $moduleList.Add([ordered]@{
             'Slot'             = Format-Value $loc
@@ -933,11 +1080,29 @@ function Get-RamInfo {
         $Script:Raw.FreeSlots  = $free
     }
 
+    $channelNames = @{ 1 = 'Single channel'; 2 = 'Dual channel'; 3 = 'Triple channel'; 4 = 'Quad channel'
+                       6 = 'Hexa channel'; 8 = 'Octa channel' }
     $channelDisplay = 'Unknown'
-    if ($channels.Count -gt 1) { $channelDisplay = "$($channels.Count) channels detected (multi-channel)" }
-    elseif ($channels.Count -eq 1 -and $usedSlots -eq 1) { $channelDisplay = 'Single channel' }
-    elseif ($usedSlots -eq 1) { $channelDisplay = 'Single channel (one module installed)' }
-    elseif ($usedSlots -ge 2) { $channelDisplay = 'Likely multi-channel (estimated from module count)' }
+    if ($channels.Count -ge 2) {
+        $label = "$($channels.Count)-channel"
+        if ($channelNames.ContainsKey($channels.Count)) { $label = $channelNames[$channels.Count] }
+        $chList = @($channels | Sort-Object) -join ', '
+        $channelDisplay = "$label (channels populated: $chList)"
+        $Script:Raw.ChannelCount = $channels.Count
+    }
+    elseif ($channels.Count -eq 1 -and $usedSlots -ge 2) {
+        $channelDisplay = "Single channel ($usedSlots modules share channel $($channels[0]))"
+        $Script:Raw.ChannelCount = 1
+    }
+    elseif ($usedSlots -eq 1) {
+        $channelDisplay = 'Single channel (one module installed)'
+        $Script:Raw.ChannelCount = 1
+    }
+    elseif ($usedSlots -ge 2) {
+        # Channel not encoded in SMBIOS labels; fall back to module pairing.
+        if ($usedSlots % 2 -eq 0) { $channelDisplay = 'Likely dual channel (even module count; channel labels not exposed)' }
+        else { $channelDisplay = "Undetermined ($usedSlots modules; channel labels not exposed)" }
+    }
 
     $Script:Raw.RamGB = [Math]::Round($totalBytes / 1GB, 1)
     $Script:Raw.MemoryModules = $usedSlots
@@ -969,6 +1134,102 @@ function Get-TrimState {
     return 'Unknown (query requires Administrator on some systems)'
 }
 
+$Script:SmartAttrNames = @{
+    1 = 'Raw Read Error Rate'; 2 = 'Throughput Performance'; 3 = 'Spin-Up Time'
+    4 = 'Start/Stop Count'; 5 = 'Reallocated Sectors Count'; 7 = 'Seek Error Rate'
+    8 = 'Seek Time Performance'; 9 = 'Power-On Hours'; 10 = 'Spin Retry Count'
+    11 = 'Calibration Retry Count'; 12 = 'Power Cycle Count'; 13 = 'Soft Read Error Rate'
+    170 = 'Available Reserved Space'; 171 = 'Program Fail Count'; 172 = 'Erase Fail Count'
+    173 = 'Wear Leveling Count'; 174 = 'Unexpected Power Loss Count'; 175 = 'Power Loss Protection Failure'
+    177 = 'Wear Leveling Count'; 179 = 'Used Reserved Block Count'; 180 = 'Unused Reserved Block Count'
+    181 = 'Program Fail Count'; 182 = 'Erase Fail Count'; 183 = 'SATA Downshift Error Count'
+    184 = 'End-to-End Error'; 187 = 'Reported Uncorrectable Errors'; 188 = 'Command Timeout'
+    189 = 'High Fly Writes'; 190 = 'Airflow Temperature'; 191 = 'G-Sense Error Rate'
+    192 = 'Power-off Retract Count'; 193 = 'Load Cycle Count'; 194 = 'Temperature'
+    195 = 'Hardware ECC Recovered'; 196 = 'Reallocation Event Count'; 197 = 'Current Pending Sector Count'
+    198 = 'Offline Uncorrectable Sector Count'; 199 = 'UDMA CRC Error Count'; 200 = 'Multi-Zone Error Rate'
+    201 = 'Soft Read Error Rate'; 202 = 'Data Address Mark Errors'; 231 = 'SSD Life Left'
+    232 = 'Endurance Remaining'; 233 = 'Media Wearout Indicator'; 235 = 'Power Loss Protection'
+    240 = 'Head Flying Hours'; 241 = 'Total LBAs Written'; 242 = 'Total LBAs Read'
+    249 = 'NAND Writes'
+}
+
+function Convert-SmartVendorData {
+    <#
+        Decodes the 512-byte ATA SMART vendor blob returned by
+        MSStorageDriver_FailurePredictData: 30 entries of 12 bytes starting
+        at offset 2 (id, flags[2], value, worst, raw[6 little-endian]).
+        The thresholds blob shares the layout with the threshold at byte 1.
+        Returns @{ Attributes = ordered dict for display; Critical = list of
+        human-readable problem strings }.
+    #>
+    param([byte[]]$Data, [byte[]]$Thresholds)
+    $result = @{ Attributes = [ordered]@{}; Critical = [System.Collections.Generic.List[string]]::new() }
+    if ($null -eq $Data -or $Data.Length -lt 362) { return $result }
+
+    $thrMap = @{}
+    if ($Thresholds -is [byte[]] -and $Thresholds.Length -ge 362) {
+        for ($i = 0; $i -lt 30; $i++) {
+            $off = 2 + ($i * 12)
+            $id = [int]$Thresholds[$off]
+            if ($id -ne 0) { $thrMap[$id] = [int]$Thresholds[$off + 1] }
+        }
+    }
+
+    for ($i = 0; $i -lt 30; $i++) {
+        $off = 2 + ($i * 12)
+        $id = [int]$Data[$off]
+        if ($id -eq 0) { continue }
+        $value = [int]$Data[$off + 3]
+        $worst = [int]$Data[$off + 4]
+        $raw = [uint64]0
+        for ($b = 5; $b -ge 0; $b--) { $raw = ($raw -shl 8) -bor [uint64]$Data[$off + 5 + $b] }
+
+        $name = "Vendor-specific attribute $id"
+        if ($Script:SmartAttrNames.ContainsKey($id)) { $name = $Script:SmartAttrNames[$id] }
+
+        # Raw-value interpretation for the attributes with a well-known unit.
+        $rawDisplay = "$raw"
+        switch ($id) {
+            9   { $rawDisplay = ('{0:N0} h (~{1:N1} years)' -f [double]$raw, ([double]$raw / 8760)) }
+            190 { $rawDisplay = "$($raw -band 0xFF) $($Script:G.Deg)C" }
+            194 { $rawDisplay = "$($raw -band 0xFF) $($Script:G.Deg)C" }
+            241 { $rawDisplay = ('{0:N0} (unit is vendor-specific: LBAs, 32 MiB or GiB)' -f [double]$raw) }
+            242 { $rawDisplay = ('{0:N0} (unit is vendor-specific: LBAs, 32 MiB or GiB)' -f [double]$raw) }
+        }
+
+        $thrText = ''
+        if ($thrMap.ContainsKey($id)) { $thrText = ", threshold $($thrMap[$id])" }
+        $label = ('{0:D3} {1}' -f $id, $name)
+        $result.Attributes[$label] = "value $value, worst $worst$thrText, raw $rawDisplay"
+
+        # Health interpretation: any grown defect counter above zero, or a
+        # normalized value at/below its failure threshold, is a real problem.
+        if ($id -in @(5, 184, 187, 196, 197, 198) -and $raw -gt 0) {
+            [void]$result.Critical.Add("$name = $raw")
+        }
+        elseif ($thrMap.ContainsKey($id) -and $thrMap[$id] -gt 0 -and $value -le $thrMap[$id]) {
+            [void]$result.Critical.Add("$name at $value (failure threshold $($thrMap[$id]))")
+        }
+    }
+    return $result
+}
+
+function Get-SmartDataIndex {
+    <#
+        One-shot query of the ATA SMART data/threshold WMI classes (root\wmi,
+        normally Administrator-only). Returns a hashtable keyed by the
+        normalized InstanceName (matches the disk PNPDeviceID).
+    #>
+    param([string]$ClassName)
+    $index = @{}
+    foreach ($row in @(Get-CimSafe $ClassName 'root/wmi')) {
+        $inst = "$(Get-PropValue $row @('InstanceName'))" -replace '_\d+$', ''
+        if ($inst) { $index[$inst.ToUpperInvariant()] = Get-PropValue $row @('VendorSpecific') }
+    }
+    return $index
+}
+
 function Get-StorageInfo {
     $wmiDisks = @(Get-CimSafe 'Win32_DiskDrive')
     $physicalDisks = Invoke-Safe { @(Get-PhysicalDisk -ErrorAction Stop) } @()
@@ -979,6 +1240,8 @@ function Get-StorageInfo {
         if ($r) { $reliability["$($pd.DeviceId)"] = $r }
     }
     $predict = @(Get-CimSafe 'MSStorageDriver_FailurePredictStatus' 'root/wmi')
+    $smartData = Get-SmartDataIndex 'MSStorageDriver_FailurePredictData'
+    $smartThresholds = Get-SmartDataIndex 'MSStorageDriver_FailurePredictThresholds'
 
     # System-drive disk number, used by the buyer analysis.
     $bootDiskNumber = Invoke-Safe {
@@ -1005,6 +1268,11 @@ function Get-StorageInfo {
         }
 
         # --- classification -------------------------------------------------
+        # Layered identification: PhysicalDisk BusType (string via
+        # Get-PhysicalDisk, numeric via raw MSFT_PhysicalDisk), the disk's
+        # PNPDeviceID (NVMe drives expose VEN_NVME even when Storage
+        # Management is unavailable), MediaType, spindle speed and finally
+        # the model name as a last resort.
         $busType = $null; $mediaType = $null; $spindle = $null; $health = $null
         if ($pd) {
             $busType   = Get-PropValue $pd @('BusType')
@@ -1012,19 +1280,52 @@ function Get-StorageInfo {
             $spindle   = Get-PropValue $pd @('SpindleSpeed')
             $health    = Get-PropValue $pd @('HealthStatus')
         }
-        if (-not $busType) { $busType = Get-PropValue $d @('InterfaceType') }
+        $busTypeMap = @{ 1 = 'SCSI'; 2 = 'ATAPI'; 3 = 'ATA'; 4 = 'IEEE 1394'; 7 = 'USB'; 8 = 'RAID'
+                         9 = 'iSCSI'; 10 = 'SAS'; 11 = 'SATA'; 12 = 'SD'; 13 = 'MMC'; 17 = 'NVMe' }
+        if ("$busType" -match '^\d+$' -and $busTypeMap.ContainsKey([int]$busType)) { $busType = $busTypeMap[[int]$busType] }
+        $mediaMap = @{ 3 = 'HDD'; 4 = 'SSD'; 5 = 'SCM' }
+        if ("$mediaType" -match '^\d+$' -and $mediaMap.ContainsKey([int]$mediaType)) { $mediaType = $mediaMap[[int]$mediaType] }
+        $interface = "$(Get-PropValue $d @('InterfaceType'))"
+        if (-not $busType) { $busType = $interface }
+        $pnpId = "$(Get-PropValue $d @('PNPDeviceID'))"
+
+        $isNvme = ("$busType" -match 'NVMe') -or ($pnpId -match 'NVME')
+        $isUsb  = ("$busType" -match 'USB') -or ($interface -match 'USB')
+        $isSolid = $isNvme -or ("$mediaType" -match 'SSD') -or
+                   ($null -ne $spindle -and [int64]$spindle -eq 0 -and "$mediaType" -notmatch 'Unspecified')
+        $isRotational = ("$mediaType" -match 'HDD') -or ($null -ne $spindle -and [int64]$spindle -gt 0)
 
         $kind = 'Unknown'
-        if ("$busType" -match 'NVMe') { $kind = 'NVMe SSD' }
-        elseif ("$mediaType" -match 'SSD') { $kind = 'SSD' }
-        elseif ("$mediaType" -match 'HDD') { $kind = 'HDD' }
-        elseif ($null -ne $spindle -and [int64]$spindle -eq 0 -and "$mediaType" -notmatch 'Unspecified') { $kind = 'SSD' }
-        elseif ($null -ne $spindle -and [int64]$spindle -gt 0) { $kind = 'HDD' }
-        elseif ($model -match 'SSD|NVMe|M\.2') { $kind = 'SSD (estimated from model name)' }
+        if ($isNvme) { $kind = 'NVMe SSD' }
+        elseif ("$busType" -match '^(SD|MMC)$') { $kind = 'eMMC / SD storage' }
+        elseif ($isSolid) {
+            if ($isUsb) { $kind = 'External SSD (USB)' }
+            elseif ("$busType" -match 'SATA' -or $interface -match 'IDE|SCSI') { $kind = 'SATA SSD' }
+            else { $kind = 'SSD' }
+        }
+        elseif ($isRotational) {
+            if ($isUsb) { $kind = 'External HDD (USB)' } else { $kind = 'HDD' }
+        }
+        elseif ($model -match 'NVMe') { $kind = 'NVMe SSD (estimated from model name)' }
+        elseif ($model -match 'SSD|M\.2') { $kind = 'SSD (estimated from model name)' }
+        elseif ($isUsb) { $kind = 'External drive (USB)' }
 
         if ($kind -match 'SSD') { $Script:Raw.HasSSD = $true }
         if ($kind -match 'NVMe') { $Script:Raw.HasNVMe = $true }
-        if ($null -ne $index -and "$index" -eq "$bootDiskNumber") { $Script:Raw.BootDiskType = $kind; $Script:Raw.BootDiskModel = $model }
+        $isBootDisk = ($null -ne $index -and "$index" -eq "$bootDiskNumber")
+        if ($isBootDisk) { $Script:Raw.BootDiskType = $kind; $Script:Raw.BootDiskModel = $model }
+
+        # PCIe link of the owning NVMe controller (via the PnP parent chain).
+        $pcieLink = $null
+        if ($isNvme -and -not $isUsb) {
+            $link = Get-PcieLinkInfo $pnpId
+            if ($link.Display) {
+                $pcieLink = $link.Display
+                if ($isBootDisk) { $Script:Raw.BootNvmeLink = $link.Display }
+            } else {
+                $pcieLink = 'Unknown (link properties not exposed)'
+            }
+        }
 
         $rpm = 'Not applicable'
         if ($kind -match 'HDD') {
@@ -1034,7 +1335,6 @@ function Get-StorageInfo {
         # --- SMART ----------------------------------------------------------
         $smart = Format-Value (Get-PropValue $d @('Status'))     # Win32_DiskDrive.Status ("OK")
         if ($health) { $smart = "$health" }
-        $pnpId = "$(Get-PropValue $d @('PNPDeviceID'))"
         foreach ($p in @($predict)) {
             $inst = "$(Get-PropValue $p @('InstanceName'))" -replace '_\d+$', ''
             if ($pnpId -and $inst -and ($inst -ieq $pnpId)) {
@@ -1043,6 +1343,27 @@ function Get-StorageInfo {
         }
         if ($smart -match 'Warning|Unhealthy|Failure|Pred Fail') {
             [void]$Script:Raw.SmartIssues.Add("$model : $smart")
+        }
+
+        # --- decoded SMART attributes (ATA only) ----------------------------
+        $smartAttrs = $null
+        if ($isNvme) {
+            $smartAttrs = 'Not applicable (NVMe drives report health via reliability counters above)'
+        } else {
+            $key = $pnpId.ToUpperInvariant()
+            if ($smartData.ContainsKey($key)) {
+                $decoded = Convert-SmartVendorData $smartData[$key] $smartThresholds[$key]
+                if ($decoded.Attributes.Count -gt 0) {
+                    $smartAttrs = $decoded.Attributes
+                    foreach ($c in $decoded.Critical) {
+                        [void]$Script:Raw.SmartIssues.Add("$model : $c")
+                    }
+                }
+            }
+            if ($null -eq $smartAttrs) {
+                if (Test-IsAdmin) { $smartAttrs = 'Not available (drive or driver does not expose ATA SMART data)' }
+                else { $smartAttrs = 'Unknown (requires Administrator)' }
+            }
         }
 
         # --- reliability counters -------------------------------------------
@@ -1089,7 +1410,7 @@ function Get-StorageInfo {
         $partStyle = 'Unknown'
         if ($gd) { $partStyle = "$(Get-PropValue $gd @('PartitionStyle'))" }
 
-        $diskList.Add([ordered]@{
+        $disk = [ordered]@{
             'Model'            = $model
             'Manufacturer'     = Format-Value (Get-PropValue $d @('Manufacturer'))
             'Type'             = $kind
@@ -1106,7 +1427,10 @@ function Get-StorageInfo {
             'SSD Life Remaining' = $lifeDisplay
             'Power-On Hours'   = $pohDisplay
             'Temperature'      = $tempDisplay
-        })
+        }
+        if ($pcieLink) { $disk['PCIe Link'] = $pcieLink }
+        $disk['SMART Attributes'] = $smartAttrs
+        $diskList.Add($disk)
     }
 
     # --- volumes -------------------------------------------------------------
@@ -1189,6 +1513,7 @@ function Get-GpuInfo {
     if ($controllers.Count -eq 0) { return [ordered]@{ 'Status' = 'Unknown (GPU query failed)' } }
 
     $Script:Raw.GpuDriverDates = [System.Collections.Generic.List[object]]::new()
+    $Script:Raw.GpuLinkNotes = [System.Collections.Generic.List[string]]::new()
     $gpuList = [System.Collections.Generic.List[object]]::new()
     foreach ($g in $controllers) {
         $name = Format-Value (Get-PropValue $g @('Name'))
@@ -1205,11 +1530,29 @@ function Get-GpuInfo {
             if ($r) { $res += " @ $r Hz" }
         }
 
+        $class = Test-GpuIntegrated $name $vendor
+        $gpuPnpId = "$(Get-PropValue $g @('PNPDeviceID'))"
+        $pcieDisplay = 'Unknown (link properties not exposed)'
+        if ($gpuPnpId -match '^PCI\\') {
+            $link = Get-PcieLinkInfo $gpuPnpId
+            if ($link.Display) {
+                $pcieDisplay = $link.Display
+                if ($class -eq 'Dedicated' -and $link.MaxWidth -and $link.CurWidth -and
+                    $link.CurWidth -lt $link.MaxWidth) {
+                    [void]$Script:Raw.GpuLinkNotes.Add(
+                        "$name is linked at x$($link.CurWidth) although the GPU supports x$($link.MaxWidth)")
+                }
+            }
+        } elseif ($class -eq 'Integrated') {
+            $pcieDisplay = 'Not applicable (integrated GPU)'
+        }
+
         $gpuList.Add([ordered]@{
             'Model'           = $name
             'Vendor'          = $vendor
-            'Class'           = Test-GpuIntegrated $name $vendor
+            'Class'           = $class
             'VRAM'            = Get-GpuVram $g
+            'PCIe Link'       = $pcieDisplay
             'Driver Version'  = Format-Value (Get-PropValue $g @('DriverVersion'))
             'Driver Date'     = Format-Date (Get-PropValue $g @('DriverDate'))
             'Current Mode'    = $res
@@ -1617,6 +1960,274 @@ function Get-SensorInfo {
 }
 
 # ============================================================================
+#  PERFORMANCE BENCHMARK (opt-in via -Benchmark)
+# ============================================================================
+
+function New-Sha256Hasher {
+    # SHA256Cng is the fast native implementation on Windows PowerShell 5.1;
+    # SHA256.Create() already returns a native implementation on PowerShell 7+.
+    $h = Invoke-Safe { New-Object System.Security.Cryptography.SHA256Cng }
+    if ($null -eq $h) { $h = [System.Security.Cryptography.SHA256]::Create() }
+    return $h
+}
+
+function Invoke-CpuBenchmark {
+    <#
+        Measures sustained SHA-256 hashing throughput (native crypto code, so
+        it exercises the CPU rather than the PowerShell interpreter).
+        Single-thread first, then one runspace per logical processor.
+    #>
+    param([double]$Seconds = 1.5)
+    $result = @{ SingleMBps = $null; MultiMBps = $null; Threads = [Environment]::ProcessorCount; Scaling = $null }
+
+    $buffer = New-Object byte[] (4MB)
+    (New-Object Random 12345).NextBytes($buffer)
+
+    $hasher = New-Sha256Hasher
+    $bytes = [long]0
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($sw.Elapsed.TotalSeconds -lt $Seconds) {
+        [void]$hasher.ComputeHash($buffer)
+        $bytes += $buffer.Length
+    }
+    $sw.Stop()
+    $hasher.Dispose()
+    if ($sw.Elapsed.TotalSeconds -gt 0) {
+        $result.SingleMBps = [Math]::Round($bytes / 1MB / $sw.Elapsed.TotalSeconds, 0)
+    }
+
+    $workerText = @'
+param($buf, $seconds)
+$h = $null
+try { $h = New-Object System.Security.Cryptography.SHA256Cng } catch { }
+if ($null -eq $h) { $h = [System.Security.Cryptography.SHA256]::Create() }
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+$bytes = [long]0
+while ($sw.Elapsed.TotalSeconds -lt $seconds) {
+    [void]$h.ComputeHash($buf)
+    $bytes += $buf.Length
+}
+$sw.Stop()
+$h.Dispose()
+@($bytes, $sw.Elapsed.TotalSeconds)
+'@
+    $pool = $null
+    $jobs = @()
+    try {
+        $pool = [runspacefactory]::CreateRunspacePool(1, $result.Threads)
+        $pool.Open()
+        for ($t = 0; $t -lt $result.Threads; $t++) {
+            $ps = [powershell]::Create()
+            $ps.RunspacePool = $pool
+            [void]$ps.AddScript($workerText).AddArgument($buffer).AddArgument($Seconds)
+            $jobs += @{ PS = $ps; Handle = $ps.BeginInvoke() }
+        }
+        $totalBytes = [long]0
+        $maxSeconds = 0.0
+        foreach ($job in $jobs) {
+            $out = @($job.PS.EndInvoke($job.Handle))
+            if ($out.Count -ge 2) {
+                $totalBytes += [long]$out[0]
+                if ([double]$out[1] -gt $maxSeconds) { $maxSeconds = [double]$out[1] }
+            }
+        }
+        if ($maxSeconds -gt 0) {
+            $result.MultiMBps = [Math]::Round($totalBytes / 1MB / $maxSeconds, 0)
+            if ($result.SingleMBps) { $result.Scaling = [Math]::Round($result.MultiMBps / $result.SingleMBps, 1) }
+        }
+    } catch { } finally {
+        foreach ($job in $jobs) { Invoke-Safe { $job.PS.Dispose() } }
+        if ($pool) { Invoke-Safe { $pool.Dispose() } }
+    }
+    return $result
+}
+
+function Initialize-DiskBenchNative {
+    <#
+        Compiles a small native I/O helper (CreateFile with
+        FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH and a VirtualAlloc
+        sector-aligned buffer) so the disk benchmark measures the drive
+        rather than the Windows file cache. Returns $true when available.
+    #>
+    if ('PCInspector.DiskBench' -as [type]) { return $true }
+    $src = @'
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+namespace PCInspector {
+    public static class DiskBench {
+        const uint GENERIC_READ = 0x80000000, GENERIC_WRITE = 0x40000000;
+        const uint CREATE_ALWAYS = 2, OPEN_EXISTING = 3;
+        const uint FLAGS = 0xA0000000; // FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH
+        const uint MEM_RESERVE_COMMIT = 0x3000, PAGE_READWRITE = 4, MEM_RELEASE = 0x8000;
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr sec, uint disp, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool ReadFile(SafeFileHandle h, IntPtr buf, uint n, out uint read, IntPtr overlapped);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool WriteFile(SafeFileHandle h, IntPtr buf, uint n, out uint written, IntPtr overlapped);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool SetFilePointerEx(SafeFileHandle h, long dist, out long pos, uint method);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern IntPtr VirtualAlloc(IntPtr addr, UIntPtr size, uint type, uint protect);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool VirtualFree(IntPtr addr, UIntPtr size, uint type);
+
+        static void Fail() { throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()); }
+
+        public static double SequentialWrite(string path, int totalMB, int blockKB) {
+            int block = blockKB * 1024;
+            IntPtr buf = VirtualAlloc(IntPtr.Zero, (UIntPtr)block, MEM_RESERVE_COMMIT, PAGE_READWRITE);
+            if (buf == IntPtr.Zero) Fail();
+            try {
+                byte[] rnd = new byte[block];               // incompressible data so
+                new Random(12345).NextBytes(rnd);           // controllers cannot cheat
+                Marshal.Copy(rnd, 0, buf, block);
+                using (SafeFileHandle h = CreateFileW(path, GENERIC_WRITE, 0, IntPtr.Zero, CREATE_ALWAYS, FLAGS, IntPtr.Zero)) {
+                    if (h.IsInvalid) Fail();
+                    long total = (long)totalMB * 1048576, done = 0;
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    while (done < total) {
+                        uint n;
+                        if (!WriteFile(h, buf, (uint)block, out n, IntPtr.Zero)) Fail();
+                        done += n;
+                    }
+                    sw.Stop();
+                    return done / 1048576.0 / sw.Elapsed.TotalSeconds;
+                }
+            } finally { VirtualFree(buf, UIntPtr.Zero, MEM_RELEASE); }
+        }
+
+        public static double SequentialRead(string path, int blockKB) {
+            int block = blockKB * 1024;
+            IntPtr buf = VirtualAlloc(IntPtr.Zero, (UIntPtr)block, MEM_RESERVE_COMMIT, PAGE_READWRITE);
+            if (buf == IntPtr.Zero) Fail();
+            try {
+                using (SafeFileHandle h = CreateFileW(path, GENERIC_READ, 1, IntPtr.Zero, OPEN_EXISTING, FLAGS, IntPtr.Zero)) {
+                    if (h.IsInvalid) Fail();
+                    long done = 0;
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    while (true) {
+                        uint n;
+                        if (!ReadFile(h, buf, (uint)block, out n, IntPtr.Zero)) Fail();
+                        if (n == 0) break;
+                        done += n;
+                    }
+                    sw.Stop();
+                    return done / 1048576.0 / sw.Elapsed.TotalSeconds;
+                }
+            } finally { VirtualFree(buf, UIntPtr.Zero, MEM_RELEASE); }
+        }
+
+        public static double RandomRead4K(string path, long fileBytes, double seconds) {
+            IntPtr buf = VirtualAlloc(IntPtr.Zero, (UIntPtr)4096, MEM_RESERVE_COMMIT, PAGE_READWRITE);
+            if (buf == IntPtr.Zero) Fail();
+            try {
+                using (SafeFileHandle h = CreateFileW(path, GENERIC_READ, 1, IntPtr.Zero, OPEN_EXISTING, FLAGS, IntPtr.Zero)) {
+                    if (h.IsInvalid) Fail();
+                    long blocks = fileBytes / 4096;
+                    var rng = new Random(54321);
+                    long count = 0;
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    while (sw.Elapsed.TotalSeconds < seconds) {
+                        long offset = (long)(rng.NextDouble() * (blocks - 1)) * 4096;
+                        long pos;
+                        if (!SetFilePointerEx(h, offset, out pos, 0)) Fail();
+                        uint n;
+                        if (!ReadFile(h, buf, 4096, out n, IntPtr.Zero)) Fail();
+                        count++;
+                    }
+                    sw.Stop();
+                    return count / sw.Elapsed.TotalSeconds;
+                }
+            } finally { VirtualFree(buf, UIntPtr.Zero, MEM_RELEASE); }
+        }
+    }
+}
+'@
+    $ok = Invoke-Safe { Add-Type -TypeDefinition $src -ErrorAction Stop; $true } $false
+    return [bool]$ok
+}
+
+function Invoke-DiskBenchmark {
+    <#
+        Benchmarks the drive hosting the temp directory (normally the boot
+        drive) with a temporary file that is always deleted afterwards.
+    #>
+    param([int]$SizeMB = 256)
+    $result = @{ SeqWriteMBps = $null; SeqReadMBps = $null; RandReadIops = $null
+                 Target = $null; Note = $null }
+
+    $tempDir = [IO.Path]::GetTempPath()
+    $result.Target = $tempDir
+
+    $freeBytes = Invoke-Safe { (New-Object IO.DriveInfo ([IO.Path]::GetPathRoot($tempDir))).AvailableFreeSpace } 0
+    if ([double]$freeBytes -lt ([double]$SizeMB * 4MB)) {
+        $result.Note = 'Skipped (not enough free space on the temp drive)'
+        return $result
+    }
+    if (-not (Initialize-DiskBenchNative)) {
+        $result.Note = 'Not available (native I/O helper could not be compiled on this system)'
+        return $result
+    }
+
+    $file = Join-Path $tempDir ("PCInspector-bench-" + [Guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        $result.SeqWriteMBps = [Math]::Round([PCInspector.DiskBench]::SequentialWrite($file, $SizeMB, 1024), 0)
+        $result.SeqReadMBps  = [Math]::Round([PCInspector.DiskBench]::SequentialRead($file, 1024), 0)
+        $result.RandReadIops = [Math]::Round([PCInspector.DiskBench]::RandomRead4K($file, ([long]$SizeMB * 1MB), 2.0), 0)
+    } catch {
+        $result.Note = "Benchmark failed: $($_.Exception.Message)"
+    } finally {
+        Invoke-Safe { if (Test-Path -LiteralPath $file) { Remove-Item -LiteralPath $file -Force } }
+    }
+    return $result
+}
+
+function Get-BenchmarkInfo {
+    $cpu = Invoke-CpuBenchmark
+    $disk = Invoke-DiskBenchmark
+
+    $st = 'Unknown'
+    if ($cpu.SingleMBps) { $st = ('{0:N0} MB/s hashed' -f $cpu.SingleMBps); $Script:Raw.CpuStMBps = $cpu.SingleMBps }
+    $mt = 'Unknown'
+    if ($cpu.MultiMBps) { $mt = ('{0:N0} MB/s hashed' -f $cpu.MultiMBps); $Script:Raw.CpuMtMBps = $cpu.MultiMBps }
+    $scaling = 'Unknown'
+    if ($cpu.Scaling) { $scaling = ('x{0} over single thread ({1} logical processors)' -f $cpu.Scaling, $cpu.Threads) }
+
+    $diskBlock = [ordered]@{
+        'Benchmark Target' = "$($disk.Target) (drive hosting the temp directory)"
+    }
+    if ($disk.Note) {
+        $diskBlock['Result'] = $disk.Note
+    } else {
+        $sw = 'Unknown'; $sr = 'Unknown'; $rr = 'Unknown'
+        if ($disk.SeqWriteMBps) { $sw = ('{0:N0} MB/s' -f $disk.SeqWriteMBps); $Script:Raw.DiskSeqWrite = $disk.SeqWriteMBps }
+        if ($disk.SeqReadMBps)  { $sr = ('{0:N0} MB/s' -f $disk.SeqReadMBps);  $Script:Raw.DiskSeqRead  = $disk.SeqReadMBps }
+        if ($disk.RandReadIops) {
+            $rr = ('{0:N0} IOPS ({1:N1} MB/s)' -f $disk.RandReadIops, ($disk.RandReadIops * 4096 / 1MB))
+            $Script:Raw.DiskRandIops = $disk.RandReadIops
+        }
+        $diskBlock['Sequential Write (1 MB blocks)'] = $sw
+        $diskBlock['Sequential Read (1 MB blocks)']  = $sr
+        $diskBlock['Random Read (4 KB, QD1)']        = $rr
+        $diskBlock['Method'] = 'Unbuffered I/O with write-through (Windows file cache bypassed)'
+    }
+
+    return [ordered]@{
+        'CPU: SHA-256 Throughput' = [ordered]@{
+            'Single-Thread'        = $st
+            'Multi-Thread'         = $mt
+            'Multi-Thread Scaling' = $scaling
+        }
+        'Disk: Temp-Drive Speed' = $diskBlock
+        'Note' = 'Quick indicative benchmark (short runs, QD1); not a substitute for dedicated tools'
+    }
+}
+
+# ============================================================================
 #  HEALTH CHECK + BUYER ANALYSIS
 # ============================================================================
 
@@ -1634,6 +2245,7 @@ function Get-HealthChecks {
 
     # RAM
     if ($Script:Raw.MemoryModules -eq 1) { & $add 'WARN' 'RAM' 'Only one memory module installed - RAM is running in single channel, which reduces performance.' }
+    if ($Script:Raw.ChannelCount -eq 1 -and $Script:Raw.MemoryModules -ge 2) { & $add 'WARN' 'RAM' "All $($Script:Raw.MemoryModules) memory modules sit on the same channel - RAM is running in single channel despite multiple modules." }
     if ($Script:Raw.RamSpeed) {
         if ($Script:Raw.DdrGen -match 'DDR4' -and $Script:Raw.RamSpeed -lt 2400) { & $add 'WARN' 'RAM' "DDR4 memory is running at $($Script:Raw.RamSpeed) MT/s, below typical DDR4 speeds (2400+)." }
         if ($Script:Raw.DdrGen -match 'DDR3' -and $Script:Raw.RamSpeed -lt 1333) { & $add 'WARN' 'RAM' "DDR3 memory is running at $($Script:Raw.RamSpeed) MT/s, below typical DDR3 speeds." }
@@ -1661,6 +2273,24 @@ function Get-HealthChecks {
         if ($g.Date -and ((Get-Date) - $g.Date).TotalDays -gt 900) {
             & $add 'INFO' 'GPU' ('GPU driver for "{0}" dates from {1:yyyy-MM-dd}; a newer driver is likely available.' -f $g.Name, $g.Date)
         }
+    }
+
+    # GPU PCIe link running below the slot's capability
+    foreach ($note in @($Script:Raw.GpuLinkNotes)) {
+        & $add 'INFO' 'GPU' "$note. Some GPUs downtrain the link when idle; verify under load or check the slot used."
+    }
+
+    # Benchmark results (temp drive normally lives on the boot drive)
+    if ($Script:Raw.DiskSeqRead) {
+        if ($Script:Raw.BootDiskType -match 'NVMe' -and $Script:Raw.DiskSeqRead -lt 800) {
+            & $add 'INFO' 'Benchmark' "NVMe drive reads $($Script:Raw.DiskSeqRead) MB/s sequential - below what NVMe typically delivers; check the PCIe link, thermals or drive health."
+        }
+        elseif ($Script:Raw.BootDiskType -match 'SSD' -and $Script:Raw.DiskSeqRead -lt 150) {
+            & $add 'WARN' 'Benchmark' "SSD reads only $($Script:Raw.DiskSeqRead) MB/s sequential - HDD-level performance; the drive may be failing, thermally throttled or on a limited port."
+        }
+    }
+    if ($Script:Raw.DiskRandIops -and $Script:Raw.BootDiskType -match 'SSD|NVMe' -and $Script:Raw.DiskRandIops -lt 5000) {
+        & $add 'INFO' 'Benchmark' "Random 4K read performance is $($Script:Raw.DiskRandIops) IOPS - low for an SSD (QD1 measurement; heavy background activity can also depress this)."
     }
 
     # Battery
@@ -1697,6 +2327,13 @@ function Get-BuyerAnalysis {
     }
     if ($Script:Raw.HasNVMe) { $facts.Add('System already uses NVMe storage.') }
     elseif ($Script:Raw.HasSSD) { $facts.Add('System uses SATA SSD storage (no NVMe detected).') }
+    if ($Script:Raw.BootNvmeLink) { $facts.Add("Boot NVMe drive PCIe link: $($Script:Raw.BootNvmeLink).") }
+    if ($Script:Raw.BoardPcieGen) { $facts.Add("Motherboard supports at least PCIe $($Script:PcieGenMap[$Script:Raw.BoardPcieGen]).") }
+    if ($Script:Raw.ChannelCount) {
+        $mode = 'single channel'
+        if ($Script:Raw.ChannelCount -ge 2) { $mode = "$($Script:Raw.ChannelCount)-channel mode" }
+        $facts.Add("Memory is running in $mode.")
+    }
     if ($Script:Raw.BootDiskType) {
         $facts.Add("Windows boot drive type: $($Script:Raw.BootDiskType) ($($Script:Raw.BootDiskModel)).")
     }
@@ -1716,6 +2353,12 @@ function Get-BuyerAnalysis {
         $facts.Add("Battery retains $([Math]::Round(100 - $Script:Raw.BatteryWearPct, 1))% of its original design capacity.")
     }
     if ($Script:Raw.CpuCores) { $facts.Add("CPU provides $($Script:Raw.CpuCores) physical core(s): $($Script:Raw.CpuName).") }
+    if ($Script:Raw.CpuStMBps -and $Script:Raw.CpuMtMBps) {
+        $facts.Add("CPU benchmark (SHA-256): $($Script:Raw.CpuStMBps) MB/s single-thread, $($Script:Raw.CpuMtMBps) MB/s multi-thread.")
+    }
+    if ($Script:Raw.DiskSeqRead -and $Script:Raw.DiskSeqWrite) {
+        $facts.Add("Disk benchmark (temp drive): $($Script:Raw.DiskSeqRead) MB/s read, $($Script:Raw.DiskSeqWrite) MB/s write sequential.")
+    }
 
     if ($facts.Count -eq 0) { $facts.Add('Not enough data was collected to generate observations.') }
     return $facts
@@ -1777,9 +2420,187 @@ function Out-SummarySection {
     Out-Line ("  Inspection completed in {0:N1} seconds." -f $Elapsed.TotalSeconds) DarkGray
 }
 
+function Convert-HtmlText {
+    param($Text)
+    return [System.Net.WebUtility]::HtmlEncode("$Text")
+}
+
+function Get-ValueCssClass {
+    # Reuses the console color logic so HTML and console always agree.
+    param([string]$Value)
+    switch ("$(Get-ValueColor $Value)") {
+        'DarkGray' { return 'muted' }
+        'Green'    { return 'good' }
+        'Yellow'   { return 'warn' }
+        'Red'      { return 'bad' }
+        default    { return '' }
+    }
+}
+
+function Add-HtmlKVBlock {
+    <# HTML twin of Write-KVBlock: renders a section dictionary recursively. #>
+    param([System.Text.StringBuilder]$Sb, $Data)
+    if ($null -eq $Data) { return }
+    $rows = New-Object System.Text.StringBuilder
+    $addRow = {
+        param($k, $v)
+        $display = Format-Value $v
+        $cls = Get-ValueCssClass $display
+        [void]$rows.Append('<tr><td>').Append((Convert-HtmlText $k)).
+            Append('</td><td class="').Append($cls).Append('">').
+            Append((Convert-HtmlText $display)).Append('</td></tr>')
+    }
+    $flush = {
+        if ($rows.Length -gt 0) {
+            [void]$Sb.Append('<table class="kv">').Append($rows.ToString()).Append('</table>')
+            [void]$rows.Clear()
+        }
+    }
+    foreach ($key in @($Data.Keys)) {
+        $val = $Data[$key]
+        if ($val -is [System.Collections.IDictionary]) {
+            & $flush
+            [void]$Sb.Append('<div class="sub"><h4>').Append((Convert-HtmlText $key)).Append('</h4>')
+            Add-HtmlKVBlock $Sb $val
+            [void]$Sb.Append('</div>')
+        }
+        elseif ($val -is [System.Collections.IEnumerable] -and $val -isnot [string]) {
+            $items = @($val)
+            if ($items.Count -eq 0) {
+                & $addRow $key 'None detected'
+            }
+            elseif ($items[0] -is [System.Collections.IDictionary]) {
+                & $flush
+                $label = Get-SingularLabel $key
+                for ($i = 0; $i -lt $items.Count; $i++) {
+                    [void]$Sb.Append('<div class="sub"><h4>').
+                        Append((Convert-HtmlText "$label $($i + 1)")).Append('</h4>')
+                    Add-HtmlKVBlock $Sb $items[$i]
+                    [void]$Sb.Append('</div>')
+                }
+            }
+            else {
+                & $addRow $key (@($items | ForEach-Object { "$_" }) -join ', ')
+            }
+        }
+        else {
+            & $addRow $key $val
+        }
+    }
+    & $flush
+}
+
+function ConvertTo-HtmlReport {
+    param($Report, $Issues, $Facts, $Titles)
+    $sb = New-Object System.Text.StringBuilder
+    $css = @'
+:root{--bg:#f4f6f8;--card:#ffffff;--text:#1a1f27;--muted:#6d7686;--line:#e2e6ec;--accent:#0a66c2;--good:#177a33;--warn:#96650a;--bad:#c1121f}
+@media (prefers-color-scheme:dark){:root{--bg:#11151a;--card:#1a2028;--text:#e4e8ee;--muted:#8b94a5;--line:#2a3240;--accent:#58a6ff;--good:#3fb950;--warn:#d29922;--bad:#f85149}}
+*{box-sizing:border-box}body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);margin:0;padding:24px;line-height:1.45}
+.wrap{max-width:1020px;margin:0 auto}
+h1{font-size:1.5em;margin:0}
+.meta{color:var(--muted);font-size:.9em;margin:4px 0 16px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin:14px 0 20px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
+.card .k{color:var(--muted);font-size:.78em;text-transform:uppercase;letter-spacing:.04em}
+.card .v{font-weight:600;font-size:.95em;overflow-wrap:anywhere}
+details{background:var(--card);border:1px solid var(--line);border-radius:8px;margin:12px 0;padding:0 16px}
+summary{font-weight:600;padding:12px 0;cursor:pointer;color:var(--accent)}
+table.kv{width:100%;border-collapse:collapse;margin:2px 0 12px}
+.kv td{padding:4px 8px;border-bottom:1px solid var(--line);vertical-align:top;overflow-wrap:anywhere}
+.kv tr:last-child td{border-bottom:none}
+.kv td:first-child{color:var(--muted);width:35%}
+.sub{margin:6px 0 10px 10px;padding-left:12px;border-left:2px solid var(--line)}
+.sub h4{margin:8px 0 4px;font-size:.95em}
+.good{color:var(--good)}.warn{color:var(--warn)}.bad{color:var(--bad)}.muted{color:var(--muted)}
+.sev{display:inline-block;font-weight:700;font-size:.78em;padding:1px 9px;border-radius:10px;border:1px solid currentColor;min-width:44px;text-align:center}
+ul.facts{margin:4px 0 12px;padding-left:22px}
+footer{color:var(--muted);font-size:.85em;margin:18px 0 4px;text-align:center}
+'@
+    $admin = 'no'
+    if (Test-IsAdmin) { $admin = 'yes' }
+    [void]$sb.Append('<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">')
+    [void]$sb.Append('<meta name="viewport" content="width=device-width, initial-scale=1">')
+    [void]$sb.Append('<title>PC Inspector Report - ').Append((Convert-HtmlText $env:COMPUTERNAME)).Append('</title>')
+    [void]$sb.Append('<style>').Append($css).Append('</style></head><body><div class="wrap">')
+    [void]$sb.Append('<h1>PC Inspector Report</h1><p class="meta">v').Append((Convert-HtmlText $Script:Version))
+    [void]$sb.Append(' &middot; Host: ').Append((Convert-HtmlText $env:COMPUTERNAME))
+    [void]$sb.Append(' &middot; ').Append((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))
+    [void]$sb.Append(' &middot; Administrator: ').Append($admin).Append('</p>')
+
+    # Summary cards (mirrors the console summary).
+    $sys = $Report['System']; $cpu = $Report['CPU']; $ram = $Report['RAM']
+    $bootType = 'Unknown'
+    if ($Script:Raw.BootDiskType) { $bootType = $Script:Raw.BootDiskType }
+    $gpuNames = @()
+    if ($Report['GPU'] -and $Report['GPU'].Contains('GPUs')) {
+        foreach ($g in @($Report['GPU']['GPUs'])) { $gpuNames += $g['Model'] }
+    }
+    $gpuDisplay = 'Unknown'
+    if ($gpuNames.Count -gt 0) { $gpuDisplay = $gpuNames -join ' / ' }
+    $crit = @($Issues | Where-Object { $_['Severity'] -eq 'CRIT' }).Count
+    $warn = @($Issues | Where-Object { $_['Severity'] -eq 'WARN' }).Count
+    $verdict = 'No warnings raised'
+    $verdictCls = 'good'
+    if ($crit -gt 0) { $verdict = "$crit critical / $warn warning(s)"; $verdictCls = 'bad' }
+    elseif ($warn -gt 0) { $verdict = "$warn warning(s)"; $verdictCls = 'warn' }
+    $cards = @(
+        @('Machine', "$($sys['Manufacturer']) $($sys['Model'])", '')
+        @('OS', "$($sys['Windows Edition'])", '')
+        @('CPU', "$($cpu['Model'])", '')
+        @('RAM', "$($ram['Total Installed']) $($ram['Memory Type'])", '')
+        @('Boot Drive', $bootType, '')
+        @('GPU', $gpuDisplay, '')
+        @('Health', $verdict, $verdictCls)
+    )
+    [void]$sb.Append('<div class="cards">')
+    foreach ($c in $cards) {
+        [void]$sb.Append('<div class="card"><div class="k">').Append((Convert-HtmlText $c[0])).
+            Append('</div><div class="v ').Append($c[2]).Append('">').
+            Append((Convert-HtmlText $c[1])).Append('</div></div>')
+    }
+    [void]$sb.Append('</div>')
+
+    # Health check + buyer analysis first: it is what a buyer reads first.
+    [void]$sb.Append('<details open><summary>Health Check</summary><table class="kv">')
+    foreach ($i in @($Issues)) {
+        $cls = 'muted'
+        switch ($i['Severity']) {
+            'OK'   { $cls = 'good' } 'INFO' { $cls = '' }
+            'WARN' { $cls = 'warn' } 'CRIT' { $cls = 'bad' }
+        }
+        [void]$sb.Append('<tr><td><span class="sev ').Append($cls).Append('">').
+            Append((Convert-HtmlText $i['Severity'])).Append('</span> ').
+            Append((Convert-HtmlText $i['Category'])).Append('</td><td class="').
+            Append($cls).Append('">').Append((Convert-HtmlText $i['Message'])).Append('</td></tr>')
+    }
+    [void]$sb.Append('</table></details>')
+
+    [void]$sb.Append('<details open><summary>Buyer Analysis (objective observations)</summary><ul class="facts">')
+    foreach ($f in @($Facts)) { [void]$sb.Append('<li>').Append((Convert-HtmlText $f)).Append('</li>') }
+    [void]$sb.Append('</ul></details>')
+
+    # Full report sections; the noisiest device inventories start collapsed.
+    $collapsed = @('USB', 'PCI')
+    foreach ($key in @($Report.Keys)) {
+        $title = "$key"
+        if ($Titles -and $Titles.ContainsKey($key)) { $title = $Titles[$key] }
+        $open = ' open'
+        if ($key -in $collapsed) { $open = '' }
+        [void]$sb.Append('<details').Append($open).Append('><summary>').
+            Append((Convert-HtmlText $title)).Append('</summary>')
+        Add-HtmlKVBlock $sb $Report[$key]
+        [void]$sb.Append('</details>')
+    }
+
+    [void]$sb.Append('<footer>Generated by PC Inspector v').Append((Convert-HtmlText $Script:Version)).
+        Append(' &middot; MIT License</footer></div></body></html>')
+    return $sb.ToString()
+}
+
 function Export-Reports {
-    param($Report, $Issues, $Facts)
-    if (-not ($Json -or $Txt)) { return }
+    param($Report, $Issues, $Facts, $Titles)
+    if (-not ($Json -or $Txt -or $Html)) { return }
 
     $dir = $OutputPath
     if (-not $dir) {
@@ -1823,6 +2644,16 @@ function Export-Reports {
             Write-Host "  TXT export failed: $($_.Exception.Message)" -ForegroundColor Red
         }
     }
+    if ($Html) {
+        try {
+            $htmlPath = "$base.html"
+            ConvertTo-HtmlReport $Report $Issues $Facts $Titles |
+                Out-File -LiteralPath $htmlPath -Encoding utf8 -ErrorAction Stop
+            Out-Line "  HTML report saved: $htmlPath" Green
+        } catch {
+            Out-Line "  HTML export failed: $($_.Exception.Message)" Red
+        }
+    }
 }
 
 # ============================================================================
@@ -1860,6 +2691,9 @@ function Invoke-PCInspector {
         @{ Key = 'Audio';       Title = 'Audio';           Fn = { Get-AudioInfo } }
         @{ Key = 'Sensors';     Title = 'Sensors';         Fn = { Get-SensorInfo } }
     )
+    if ($Benchmark) {
+        $plan += @{ Key = 'Benchmark'; Title = 'Performance Benchmark'; Fn = { Get-BenchmarkInfo } }
+    }
 
     $report = [ordered]@{}
     for ($i = 0; $i -lt $plan.Count; $i++) {
@@ -1895,7 +2729,9 @@ function Invoke-PCInspector {
     Out-AnalysisSection $facts
     $stopwatch.Stop()
     Out-SummarySection $report $issues $stopwatch.Elapsed
-    Export-Reports $report $issues $facts
+    $titles = @{}
+    foreach ($step in $plan) { $titles[$step.Key] = $step.Title }
+    Export-Reports $report $issues $facts $titles
     Out-Line ''
 }
 
